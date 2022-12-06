@@ -187,7 +187,10 @@ Ny = F/2;
 BW_Hz = [lp_Hz hp_Hz];
 BW_N = BW_Hz/Ny;
 [b, a] = butter(ceil(bp_order/2),BW_N);
-Y = filtfilt(b,a,Rr_int);
+pad = size(Rr_int, 1);
+temprun = cat(1, zeros(pad, size(Rr_int, 2)), Rr_int, zeros(pad, size(Rr_int, 2)));
+Y = filtfilt(b,a,temprun);
+Y = Y((pad + 1):(end - pad), :);
 DVAR_post_all = dvars_from_cifti(Y);
 
 % Quick visualization of results
