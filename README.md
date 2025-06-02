@@ -2,6 +2,8 @@
 
 2024.12.01 - add DCANBOLD_reprocess.py to redo the confound removal part ([task] mode below) for minor differences (e.g. no GSR/different movement parameter file/etc) with an all-inclusive Python script that does not need anything else (MATLAB or toolboxes or Connectome Workbench) except for some basic python packages (numpy,scipy,matplotloib,nibabel) installed.
 
+2025.06.02 - Jim made some updates about loading the files. Also it seems the DCAN lab had some updates since Dec 2024 to incorporate no GSR but their no GSR means no average grayordinate signal in the regressor, but we did not have grayordinates, white matter and CSF signal in the regressor. Maybe fix the naming at some point to avoid confusion and provide different options? Also Donna/me had some scripts to create the white matter signal and CSF signal from the volume (NIFTI) data if they do not exist in the original folder, consider adding those in at some point.
+
 \*\*
 This is a repository for the dcan labs bold signal processing. It is 
 forked from FNL\_preproc and is meant to take its place.
