@@ -1,812 +1,523 @@
-#!/usr/bin/env python3
+'''
+This script takes the output from ABCD-HCP-pipeline, load the minimally preprocessed CIFTI file and apply confound removal
+Adapted from the MATLAB script dcan_bold_processing.m (https://github.com/DCAN-Labs/dcan_bold_processing/blob/main/matlab_code/dcan_signal_processing.m)
+All the dependencies are included in this file (no other script is required)
 
-__prog__ = 'DCANBOLDProc'
-__version__ = '4.0.0'
-__doc__ = \
-"""Wraps the compiled DCAN Signal Processing Matlab script, version: %s.
-Runs in 3 main modes:  [setup], [task], and [teardown].
+Potential issue: the GSR version is slightly different from the saved file in the original folder (ABCD from DCAN) potentially because of the differences in interpolation and padding?
 
-[setup]: creates white matter and ventricular masks for regression, must be
-         run prior to task.
+Author:
+    Jiaxin Cindy Tu (tu.j@wustl.edu), Jim Pollaro (jimp@wustl.edu)
+'''
+import json, argparse, os, scipy, logging, re
+import numpy as np
+import nibabel as nib
+import matplotlib.pyplot as plt
 
-[task]: computes fd numbers [1][2], runs regressions on a given task/fmri [3]
-        and outputs a corrected dtseries, along with motion numbers in an
-        hdf5 (.mat) formatted file.
+from pathlib import Path
 
-[teardown]: concatenates any resting state runs into a single dtseries, and
-            parcellates all final tasks.""" % __version__
-__references__ = \
-"""References
-----------
+def main(input_path, subject_id, task_id, output_path, session_id=None, settings_file=None, skip_save_figures=False, GSR=False, FD_type=1, brain_radius=50, bandpass_filter_order=2, highpass_cutoff=0.08, lowpass_cutoff=0.009, skip_seconds=5, fd_threshold=0.3):
+    # subject_id = args.subject_id
+    # task_id = args.task_id
+    # input_path = args.input_path
+    # output_path = args.output_path
+    # FD_type = args.FD_type
+    # brain_radius = args.brain_radius # This was in Cindy's code, but No reference. leaving for now. JP 5/25
+    # GSR = args.GSR if args.GSR else False
 
-[1] Fair DA, Miranda-Dominguez O, et al. Correction of respiratory artifacts
-in MRI head motion estimates. bioRxiv [Internet]. 2018 Jan 1; Available from:
-http://biorxiv.org/content/early/2018/06/07/337360.abstract
-[2] Power J, et al. Methods to detect, characterize, and remove motion
-artifact in resting state fMRI. Neuroimage [Internet]. Elsevier Inc.; 2014
-Jan 1 [cited 2014 Jul 9];84:32041. doi: 10.1016/j.neuroimage.2013.08.048
-[3] Friston KJ, et al. Movement-related effects in fMRI time-series. Magn
-Reson Med [Internet]. 1996;35(3):34655. doi: 10.1002/mrm.1910350312
-"""
+    
+    # Part I: parse argument
+    # Load json
+    has_sessions = True if session_id is not None else False
+    run_num = None
+    if settings_file:
+        settings_file = settings_file
+    else:
+        # This part isn't working correctly
+        subject_dir = f'{input_path}/sub-{subject_id}'
+        settings_path = subject_dir
+        subject_contents = os.listdir(subject_dir)
+        for content in subject_contents:
+            if content[:4] == 'ses-':
+                settings_path = f'{input_path}/sub-{subject_id}/ses-{session_id}/'
+                has_sessions = True
+        settings_file = f'{settings_path}files/MNINonlinear/Results/DCANBOLDProc_v4.0.0_mat_config.json'
+    with open(settings_file) as file:
+        input_json = json.load(file)
 
-import argparse
-import json
-import os
-import subprocess
-import shutil
-import sys
-import re
+    run_match = re.match(r'.*\/Results\/.*_run-([0-9]{8,12})\/DCANBOLDProc_v4\.0\.0\/DCANBOLDProc_v4\.0\.0_mat_config\.json', settings_file)
+    if run_match:
+        run_num = run_match.group(1)
 
-here = os.path.dirname(os.path.realpath(__file__))
+    logging.basicConfig(
+        filename=os.path.join(output_path, "output.log"),
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+    if has_sessions:
+        if run_num is None:
+            logging.info(f'Now processing subject sub-{subject_id} session-{session_id} task-{task_id}')
+        else:
+            logging.info(f'Now processing subject sub-{subject_id} session-{session_id} task-{task_id} run {run_num}')
+    else:
+        logging.info(f'Now processing subject sub-{subject_id} task-{task_id}')
 
+    # Set default filenames and folders
+    RESULTS_SUFFIX = 'DCANBOLDProc_v4.0.0'
+    base_output_path = f'{output_path}/sub-{subject_id}'
+    if has_sessions:
+        base_output_path += f'/ses-{session_id}'
+        if run_num is not None:
+            base_output_path += f'/run-{run_num}'
+    base_output_path += f'/task-{task_id}'
+    fmri_name_split = input_json['fMRIName'].split('_')
+    if len(fmri_name_split) > 2:
+        for name in fmri_name_split:
+            if name[:4] == '/run-':
+                base_output_path += f' {name}'
+                break
+    base_output_path += f'/{RESULTS_SUFFIX}'
+    base_output_path = Path(base_output_path)
+    
+    if GSR:
+        output_path = f'{base_output_path}/gsr'
+    else:
+        output_path = f'{base_output_path}/no_gsr'
 
-def _cli():
-    """
-    command line interface
-    :return:
-    """
-    parser = generate_parser()
-    args = parser.parse_args()
+    input_json['GSR'] = GSR
+    input_json['brain_radius_mm'] = brain_radius
+    input_json['FD_type'] = FD_type
+    input_json['path_cii'] = str.replace(input_json['path_cii'], '/output/', input_path)
+    input_json['file_mov_reg'] = str.replace(input_json['file_mov_reg'], '/output/', input_path)
+    input_json['file_vent'] = str.replace(input_json['file_vent'], '/output/', input_path)    
+    input_json['file_wm'] = str.replace(input_json['file_wm'], '/output/', input_path)
+    input_json['config'] = f'{output_path}/DCANBOLDProc_v4.0.0_mat_config.json'
 
-    kwargs = {
-        'subject': args.subject,
-        'task': args.task,
-        'output_folder': args.output_folder,
-        'legacy_tasknames': args.legacy_tasknames,
-        'fd_threshold': args.fd_threshold,
-        'contiguous_frames': args.contiguous_frames,
-        'filter_order': args.filter_order,
-        'lower_bpf': args.lower_bpf,
-        'upper_bpf': args.upper_bpf,
-        'motion_filter_type': args.motion_filter_type,
-        'physio': args.physio,
-        'motion_filter_option': args.motion_filter_option,
-        'motion_filter_order': args.motion_filter_order,
-        'band_stop_min': args.band_stop_min,
-        'band_stop_max': args.band_stop_max,
-        'skip_seconds': args.skip_seconds,
-        'brain_radius': args.brain_radius,
-        'setup': args.setup,
-        'teardown': args.teardown,
-        'tasklist': args.tasklist,
-        'fmri_res': args.fmri_res,
-        'roi_res': args.roi_res,
-        'no_aparc': args.no_aparc,
-        'sigma': args.sigma if args.sigma else args.roi_res
-    }
+    input_json.pop('path_ex_sum')
+    input_json.pop('path_wb_c')
+    
+    # Save parameters in results folder
+    directory_path = Path(output_path)
+    directory_path.mkdir(parents=True, exist_ok=True)
+    with open(input_json['config'], 'w') as file:
+        json.dump(input_json, file, sort_keys=True, indent=4)
 
-    return interface(**kwargs)
+    # Part II: Load and prepare preprocessed data
+    image = nib.load(input_json['path_cii'])
+    fdata = image.get_fdata()
+    DVAR_pre_reg = calculate_dvars_from_cifti(fdata)
 
-
-def generate_parser(parser=None):
-    """
-    generates argument parser for this program.
-    :param parser: if set, args are added to this parser.
-    :return: ArgumentParser
-    """
-    if not parser:
-        parser = argparse.ArgumentParser(
-            prog='dcan_bold_proc.py',
-            description=__doc__,
-            epilog=__references__,
-            formatter_class=argparse.RawDescriptionHelpFormatter
+    # Global signals (lines 52, 58, 83 in dcan_bold_processing.m)
+    if GSR:
+        wm = np.loadtxt(input_json['file_wm'])
+        vent = np.loadtxt(input_json['file_vent'])
+        WB = np.mean(fdata, axis=1) # Global signal in gray matter
+        Glob = np.concatenate(
+            (wm.reshape(-1, 1), vent.reshape(-1, 1), WB.reshape(-1, 1)), axis=1
         )
-    parser.add_argument(
-        '-v', '--version', action='version',
-        version='%s_v%s' % (__prog__, __version__),
-        help='print the software name and version'
+        dGlob = np.vstack(([0, 0, 0], np.diff(Glob, axis=0)))
+
+        if not skip_save_figures:
+            plt.figure(figsize=(8, 4))
+            plt.plot(Glob, linewidth=1, label=('white matter', 'ventricle', 'grayordinate'))
+            plt.title('Global Signal')
+            plt.legend()
+            plt.savefig(
+                os.path.join(output_path, 'globalsignal_trace.png'),
+                format='png',
+                dpi=300
+            )
+            plt.close()
+
+    # Get TR, in seconds (line 34 in dcan_signal_processing.m)
+    TR = nib.load(input_json['path_cii']).header.get_axis(0).step 
+    if TR > 20:
+        # if TR in ms, convert to s
+        TR /= 1000
+    logging.info("TR = " + str(TR))
+
+    # Load movement
+    assert os.path.isfile(input_json['file_mov_reg']), 'Movement Regressor File not Found'
+    filtered_movement_regressors = np.loadtxt(input_json['file_mov_reg'])
+    FR = make_friston_regressors(
+        filtered_movement_regressors, input_json['brain_radius_mm']
+    ) # 24-param Friston Regressors
+
+    # Calculate FD (line 73 in dcan_bold_processing.m)
+    FD, meanFD = calc_FD(FR[:,:6], FD_type=FD_type)
+    FD_file_name = os.path.join(
+        output_path, str.replace(Path(input_json['file_mov_reg']).name, '.txt', '_FD.txt')
     )
-    parser.add_argument(
-        '--setup', action='store_true',
-        help='prepare white matter and ventricle masks, must be run prior to '
-             'individual task runs.'
-    )
-    parser.add_argument(
-        '--subject', required=True, help='subject/participant id'
-    )
-    parser.add_argument(
-        '--task', required=True,
-        help='name of fmri data as used in the dcan fmri pipeline.  For bids '
-             'data it is set to "task-NAME"'
-    )
-    parser.add_argument(
-        '--output-folder',
-        help='output folder which contains all files produced by the dcan '
-             'fmri-pipeline.  Used for setting up standard inputs and outputs'
-    )
-    parser.add_argument(
-        '--legacy-tasknames', action='store_true',
-        help='parse input task names as done in dcan_bold_processing <= 4.0.4. '
-             'use this flag if the input task filenames use the older DCAN HCP '
-             'pipeline filename convention in which run index is appended to '
-             'task name, e.g. task-myTask01 instead of task-myTask_run-01. '
-    )
-    setup =  parser.add_argument_group(
-        'wm/vent regressors',  'options for obtaining white matter and '
-                               'ventricle signal regressors')
-    setup.add_argument(
-        '--fmri-res', type=float, default=2.,
-        help='isotropic resolution (mm) for final fmri volume. Default is 2.'
-    )
-    setup.add_argument(
-        '--roi-res', type=float, default=2.,
-         help='isotropic resolution (mm) for vent/wm roi volumes. Default is '
-              '2.'
-    )
-    setup.add_argument(
-        '--sigma', type=float,
-        help='sigma for gaussian kernel used to erode rois prior to signal '
-             'extraction.  Default is to use roi resolution'
-    )
-    setup.add_argument(
-        '--no-aparc', action='store_true',
-        help='flag to use original freesurfer LR white matter labels instead '
-             'of parcellated labels.'
-    )
-    bold_filter = parser.add_argument_group(
-        'bold signal filtering',  'bold signal filtering parameters.')
-    bold_filter.add_argument(
-        '--filter-order', type=int, default=2,
-        help='number of filter coefficients for butterworth bandpass filter.'
-    )
-    bold_filter.add_argument(
-        '--lower-bpf', type=float, default=0.009,
-        help='lower cut-off frequency (Hz) for the butterworth bandpass '
-             'filter.'
-    )
-    bold_filter.add_argument(
-        '--upper-bpf', type=float, default=0.080,
-        help='upper cut-off frequency (Hz) for the butterworth bandpass '
-             'filter.'
-    )
-    fd = parser.add_argument_group(
-        'framewise displacement', 'parameters related to computation of '
-                                  'framewise displacment (FD)')
-    fd.add_argument(
-        '--fd-threshold', type=float, default=0.3,
-        help='upper framewise displacement threshold for use in signal '
-             'regression.'
-    )
-    fd.add_argument(
-        '--skip-seconds', type=int, default=5,
-        help='number of seconds to cut off the beginning of fmri time series.'
-    )
-    fd.add_argument(
-        '--contiguous-frames', type=int, default=5,
-        help='number of contigious frames for power 2014 fd thresholding.'
-    )
-    fd.add_argument(
-        '--brain-radius', type=int,
-        help='radius of brain for computation of rotational displacements'
-    )
-    fd.add_argument(
-        '--motion-filter-type', choices=['notch','lp'], default=None,
-        help='type of band-stop filter to use for removing respiratory '
-             'artifact from motion regressors. Current options are \'notch\' '
-             'for a notch filter or \'lp\' for a lowpass filter.'
-    )
-    fd.add_argument(
-       '--motion-filter-order', type=int, default=4,
-       help='number of filter coeffecients for the band-stop filter.'
-    )
-    fd.add_argument(
-        '--band-stop-min', type=float_or_None,
-        help='lower frequency (bpm) for the band-stop motion filter.'
-    )
-    fd.add_argument(
-        '--band-stop-max', type=float_or_None,
-        help='upper frequency (bpm) for the band-stop motion filter.'
-    )
-    fd.add_argument(
-       '--motion-filter-option', type=int, default=5,
-       help='determines direction(s) in which to filter respiratory '
-            'artifact. Default is all directions.'
-    )
-    teardown = parser.add_argument_group(
-        'final concatenation', 'final stage parameters for after setup and '
-                               'tasks. Concatenates, parcellates, \nand '
-                               'saves combined FD numbers.')
-    teardown.add_argument(
-        '--teardown', action='store_true',
-        help='flag to run final concatenation steps.  After tasks have '
-             'completed, concatenate resting state data and parcellate.'
-    )
-    teardown.add_argument(
-        '--tasklist', action='append',
-        help='comma delimited tasks to be concatenated, pass in argument '
-             'multiple times to add more task lists.  Also determines which '
-             'tasks will be parcellated, so a single task may be input to '
-             'parcellate it. Required for this stage.  May be a list of one.'
-    )
-    fd.add_argument(
-        '--physio',
-        help='input .tsv file containing physio data to automatically '
-             'determine motion filter parameters. Columns, start time, and '
-             'frequency will also need to be specified. NOT IMPLEMENTED.'
-    )
+    np.savetxt(FD_file_name, FD)
+    logging.info("Mean FD = " + str(meanFD))
 
-
-    return parser
-
-
-def interface(subject, output_folder, task=None, fd_threshold=None,
-              filter_order=None, lower_bpf=None, upper_bpf=None,
-              motion_filter_type=None, motion_filter_option=None,
-              motion_filter_order=None, band_stop_min=None,
-              band_stop_max=None, skip_seconds=None, brain_radius=None,
-              contiguous_frames=None, setup=False, teardown=None,
-              tasklist=None, fmri_res=2., roi_res=2., no_aparc=False,
-              legacy_tasknames=False, **kwargs):
-    """
-    main function with 3 modes:
-        setup, task, and teardown.
-
-    setup:
-    generates white matter and ventricular masks.
-
-    task:
-    Runs filtered movement regressors, calculates mean signal
-    in ventricles and white matter, then calls dcan signal processing matlab
-    script.
-
-    teardown:
-    concatenates resting state data and creates parcellated time series.
-
-    :param subject: subject id
-    :param output_folder: base output files folder for fmri pipeline
-    :param legacy_tasknames: support legacy tasknames with run index appended to task, e.g. "task-rest01")
-    :param task: name of task
-    :param fd_threshold: threshold for use in signal regression
-    :param filter_order: order of bold signal bandpass filter
-    :param lower_bpf: lower limit of bold signal bandpass filter
-    :param upper_bpf: upper limit of bold signal bandpass filter
-    :param motion_filter_type: type of bandstop filter for filtering motion
-    regressors.  Default: 'notch'
-    :param motion_filter_option: dimensions along which to filter motion.
-    Default: 1 1 1 1 1 1 (all translations and rotations)
-    :param motion_filter_order: bandstop filter order
-    :param band_stop_min: lower limit of motion bandstop filter
-    :param band_stop_max: upper limit of motion bandstop filter
-    :param skip_seconds: number of seconds to cut of beginning of task.
-    :param brain_radius: radius for estimation of angular motion regressors
-    :param contiguous_frames: minimum contigious frames for fd thresholding.
-    :param setup: creates mask images, must be run prior to tasks.
-    :param teardown: concatenates resting state data and generates parcels.
-    :param kwargs: additional parameters.  Can be used to override default
-    paths of inputs and outputs.
-    :return:
-    """
-    # name should only reflect release version, not filter usage.
-    version_name = '%s_v%s' % (__prog__, __version__)
-
-    # standard input and output folder locations.
-    input_spec = {
-        'dtseries': os.path.join(output_folder, 'MNINonLinear', 'Results',
-                                 task, '%s_Atlas.dtseries.nii' % task),
-        'fmri_volume': os.path.join(output_folder, 'MNINonLinear', 'Results',
-                                    task, '%s.nii.gz' % task),
-        'movement_regressors': os.path.join(output_folder, 'MNINonLinear',
-                                            'Results', task,
-                                            'Movement_Regressors.txt'),
-        'output_dtseries_basename': '%s_%s_Atlas' % (task, version_name),
-        'segmentation': os.path.join(output_folder, 'MNINonLinear', 'ROIs',
-                                     'wmparc.%g.nii.gz' % roi_res)
-    }
-    input_spec.update(kwargs.get('input_spec', {}))
-    output_spec = {
-        'config': os.path.join(output_folder, 'MNINonLinear', 'Results', task,
-                               version_name,
-                               '%s_mat_config.json' % version_name),
-#        'output_ciftis': os.path.join(output_folder, version_name,
-#                                      'analyses_v2','workbench'),
-        'output_motion_numbers': os.path.join(output_folder, 'MNINonLinear',
-                                              'Results', task, version_name,
-                                              'motion_numbers.txt'),
-        'output_timecourses': os.path.join(output_folder, version_name,
-                                      'analyses_v2','timecourses'),
-        'result_dir': os.path.join(output_folder, 'MNINonLinear', 'Results',
-                                   task, version_name),
-        'summary_folder': os.path.join(output_folder,
-                                       'summary_%s' % version_name),
-        'vent_mask': os.path.join(output_folder, 'MNINonLinear',
-                                  'vent_%gmm_%s_mask_eroded.nii.gz' % \
-                                      (fmri_res, subject)),
-        'vent_mean_signal': os.path.join(output_folder, 'MNINonLinear',
-                                         'Results', task, version_name,
-                                         '%s_vent_mean.txt' % task),
-        'wm_mask': os.path.join(output_folder, 'MNINonLinear',
-                                'wm_%gmm_%s_mask_eroded.nii.gz' % \
-                                    (fmri_res, subject)),
-        'wm_mean_signal': os.path.join(output_folder, 'MNINonLinear',
-                                       'Results', task, version_name,
-                                       '%s_wm_mean.txt' % task)
-    }
-    output_spec.update(kwargs.get('output_spec', {}))
-
-    # check integrity of filter parameters:
-    if lower_bpf and upper_bpf:
-        assert lower_bpf < upper_bpf, \
-               'lower bandpass limit exceeds upper limit.'
-    if band_stop_min and band_stop_max:
-        assert band_stop_min < band_stop_max, \
-               'lower bandstop limit exceeds upper limit.'
-
-    if setup:
-        print('removing old %s outputs' % version_name)
-        # delete existing fnlpp results
-        for value in output_spec.values():
-            if task in value:
-                continue
-            elif os.path.exists(value):
-                if os.path.isfile(value) or os.path.islink(value):
-                    os.remove(value)
-                elif os.path.isdir(value):
-                    shutil.rmtree(value)
-
-        if not os.path.exists(output_spec['summary_folder']):
-            os.mkdir(output_spec['summary_folder'])
-
-        if no_aparc:
-            label_override = dict(wm_lt_R=2, wm_ut_R=2, wm_lt_L=41,
-                                  wm_ut_L=41)
-        else:
-            label_override = {}
-
-        # create white matter and ventricle masks for regression
-        make_masks(input_spec['segmentation'], output_spec['wm_mask'],
-                   output_spec['vent_mask'], fmri_res=fmri_res,
-                   roi_res=roi_res, **label_override)
-
-    elif teardown:
-        output_results = os.path.join(output_folder, 'MNINonLinear', 'Results')
-        alltasks = os.listdir(output_results)
-
-        if legacy_tasknames:
-            tasknames = sorted(list(set([d[:-2] for d in alltasks
-                                     if os.path.isdir(os.path.join(output_results,d))
-                                     and 'task-' in d])))
-        else:
-            # this regex is more permissive than BIDS (which requires task labels be alphanumeric)
-            # but is intended to be consistent with the task label extraction in helpers.py
-            # of the DCAN BIDS pipelines
-            expr = re.compile(r'.*(task-[^_]+).*')
-            tasknames = sorted(list(set([expr.match(d).group(1) for d in alltasks
-                                         if os.path.isdir(os.path.join(output_results,d))
-                                         and 'task-' in d])))
-        concatlist = []
-        for commalist in tasklist:
-            for bids_task in tasknames:
-                if bids_task in commalist:
-                    concatlist.append([d for d in commalist.split(',')
-                                       if os.path.isdir(os.path.join(output_results,d))
-                                       and bids_task in d ])
-
-        concatenate(concatlist, output_folder, legacy_tasknames)
-        parcellate(concatlist, output_folder, legacy_tasknames)
-
-        # setup inputs, then run analyses_v2
-        repetition_time = get_repetition_time(input_spec['fmri_volume'])
-        for concat in concatlist:
-            if len(concat) > 0:
-                c = concat[0]
-                if legacy_tasknames:
-                    taskset = concat[0][:-2]
-                else:
-                    expr = re.compile(r'.*(ses-(?!None)[^_]+_).*')
-                    session = expr.match(c)
-
-                    expr = re.compile(r'.*(task-[^_]+).*')
-                    tasklabel = expr.match(c)
-
-                    if session:
-                        taskset = session.group(1) + tasklabel.group(1)
-                    else:
-                        taskset = tasklabel.group(1)
-                           
-            print('Running analyses_v2 on %s' % taskset)
-
-            analysis_folder = os.path.join(output_folder, version_name,
-                                           'analyses_v2')
-            if not os.path.exists(analysis_folder):
-                os.makedirs(analysis_folder)
-            for subfolder in ['FCmaps','motion','timecourses','matlab_code',
-                              'workbench']:
-                folder = os.path.join(analysis_folder,subfolder)
-                if not os.path.exists(folder):
-                    os.makedirs(folder)
-
-            analyses_v2_config = {
-                'path_wb_c': '%s/wb_command' % os.environ['CARET7DIR'],
-                'taskname': taskset,
-                'version': version_name,
-                'epi_TR': repetition_time,
-                'summary_Dir': output_spec['summary_folder'],
-                'brain_radius_in_mm': brain_radius,
-                'expected_contiguous_frame_count': contiguous_frames,
-                'result_dir': os.path.join(analysis_folder,'motion'),
-                'path_motion_numbers': os.path.join(output_folder,
-                                                    'MNINonLinear',
-                                                    'Results', taskset + '*',
-                                                    version_name,
-                                                    'motion_numbers.txt'),
-                'path_ciftis': os.path.join(output_folder, 'MNINonLinear', 'Results'),
-                'path_timecourses': output_spec['output_timecourses'],
-                'skip_seconds': skip_seconds,
-            }
-
-            analyses_v2_json_path = os.path.join(analysis_folder, 'matlab_code',
-                                                 taskset + '_analyses_v2_mat_config.json')
-
-            # write input json for matlab script
-            with open(analyses_v2_json_path, 'w') as fd:
-                json.dump(analyses_v2_config, fd, sort_keys=True, indent=4)
-
-            executable = os.path.join(here, 'bin', 'run_analyses_v2.sh')
-            cmd = [executable, os.environ['MCRROOT'], analyses_v2_json_path]
-            print(cmd)
-            subprocess.call(cmd)
-
-    # This is the case that loops over tasks
+    # Calculate kept frames (line 78 in dcan_bold_processing.m)
+    if fd_threshold and fd_threshold > 0:
+        keepframe = FD <= fd_threshold
     else:
-        assert os.path.exists(output_spec['vent_mask']), \
-            'must run this script with --setup flag prior to running ' \
-            'individual tasks.'
-        print('removing old %s outputs for %s' % (version_name, task))
+        keepframe = np.full(len(FD), True)
+    skip_frames = np.int8(np.floor(skip_seconds / TR))
+    keepframe[:skip_frames] = False
 
-        # delete existing results
-        for value in output_spec.values():
-            if task in value and os.path.exists(value):
-                if os.path.isfile(value) or os.path.islink(value):
-                    os.remove(value)
-                elif os.path.isdir(value):
-                    shutil.rmtree(value)
+    if not skip_save_figures:
+        plt.figure(figsize=(8,4))
+        for j in np.where(keepframe==0)[0]:
+            plt.axvline(x=j, color=[.5, .5, .5], alpha=0.5)
+        plt.plot(FD, linewidth=1)
+        plt.title('FD')
+        plt.savefig(os.path.join(output_path, 'FD_trace.png'), format='png', dpi=300)
+        plt.close()
 
-        # create the result_dir
-        if not os.path.exists(output_spec['result_dir']):
-            os.mkdir(output_spec['result_dir'])
-
-        # Save paths to unfiltered movement_regressors.
-        unfiltered_root, unfiltered_ext = os.path.splitext(input_spec['movement_regressors'])
-        unfiltered_orig = os.path.abspath(input_spec['movement_regressors'])
-        unfiltered_tsv = os.path.abspath(unfiltered_root + '.tsv')
-
-        # filter motion regressors if a bandstop filter is specified
-        repetition_time = get_repetition_time(input_spec['fmri_volume'])
-        if band_stop_min or band_stop_max:
-            movreg_basename = os.path.basename(
-                input_spec['movement_regressors'])
-            filtered_movement_regressors = os.path.join(
-                output_spec['result_dir'],
-                '%s_bs%s_%s_filtered_%s' % (version_name, band_stop_min,
-                                            band_stop_max, movreg_basename)
-                )
-            executable = os.path.join(
-                here, 'bin', 'run_filtered_movement_regressors.sh')
-            cmd = [executable, os.environ['MCRROOT'],
-                   input_spec['movement_regressors'], str(repetition_time),
-                   str(motion_filter_option), str(motion_filter_order),
-                   str(band_stop_min), motion_filter_type, str(band_stop_min),
-                   str(band_stop_max), filtered_movement_regressors]
-
-            subprocess.call(cmd)
-            # update input movement regressors
-            input_spec['movement_regressors'] = filtered_movement_regressors
-
-            # Make tsv file (with tabs and headers) of filtered movement regressors.
-            filtered_root, filtered_ext = os.path.splitext(filtered_movement_regressors)
-            filtered_orig = os.path.abspath(filtered_movement_regressors)
-            filtered_tsv = os.path.abspath(filtered_root + '.tsv')
-            print("Make tsv file of filtered movement regressors: %s " % (filtered_tsv))
-            with open(filtered_tsv, 'w') as outfile:
-                # Write the header.
-                outfile.write('X\tY\tZ\tRotX\tRotY\tRotZ\tXDt\tYDt\tZDt\tRotXDt\tRotYDt\tRotZDt\n')
-                # Copy the txt file, replacing spaces with tabs.
-                with open(filtered_orig) as infile:
-                    for line in infile:
-                        tabsline = line.replace(' ', '\t')
-                        outfile.write(tabsline)
-
-        # get ventricular and white matter signals
-        mean_roi_signal(input_spec['fmri_volume'], output_spec['wm_mask'],
-                        output_spec['wm_mean_signal'], fmri_res, roi_res)
-        mean_roi_signal(input_spec['fmri_volume'], output_spec['vent_mask'],
-                        output_spec['vent_mean_signal'], fmri_res, roi_res)
-
-        # run signal processing on dtseries
-        matlab_input = {
-            'path_wb_c': '%s/wb_command' % os.environ['CARET7DIR'],
-            'bp_order': filter_order,
-            'lp_Hz': lower_bpf,
-            'hp_Hz': upper_bpf,
-            'TR': repetition_time,
-            'fd_th': fd_threshold,
-            'path_cii': input_spec['dtseries'],
-            'path_ex_sum': output_spec['summary_folder'],
-            'FNL_preproc_CIFTI_basename': input_spec['output_dtseries_basename'],
-            'fMRIName': task,
-            'file_wm': output_spec['wm_mean_signal'],
-            'file_vent': output_spec['vent_mean_signal'],
-            'file_mov_reg': input_spec['movement_regressors'],
-            'motion_filename': os.path.basename(
-                output_spec['output_motion_numbers']),
-            'skip_seconds': skip_seconds,
-            'result_dir': output_spec['result_dir']
-        }
-        # write input json for matlab script
-        with open(output_spec['config'], 'w') as fd:
-            json.dump(matlab_input, fd, sort_keys=True, indent=4)
-
-        print('running %s matlab on %s' % (version_name, task))
-        executable = os.path.join(here, 'bin', 'run_dcan_signal_processsing.sh')
-        cmd = [executable, os.environ['MCRROOT'], output_spec['config']]
-        subprocess.call(cmd)
-
-        # grab # of lines in movement regressors file for frame count file
-        with open(input_spec['movement_regressors'],'r') as f:
-            for i, l in enumerate(f):
-                pass
-            frame_count = i + 1
-
-        frames_file = os.path.join(output_spec['summary_folder'],
-                                   task + '_frames_per_scan.txt')
-
-        with open(frames_file,'w') as f:
-            f.write('%d' % frame_count)
-
-        # Make tsv file (with tabs and headers) of unfiltered movement regressors.
-        print("Make tsv file of unfiltered movement regressors: %s " % (unfiltered_tsv))
-        with open(unfiltered_tsv, 'w') as outfile:
-            # Write the header.
-            outfile.write('X\tY\tZ\tRotX\tRotY\tRotZ\tXDt\tYDt\tZDt\tRotXDt\tRotYDt\tRotZDt\n')
-            # Copy the txt file, replacing spaces with tabs.
-            with open(unfiltered_orig) as infile:
-                for line in infile:
-                    tabsline = line.replace(' ', '\t')
-                    outfile.write(tabsline)
-
-        # The end.
-        print('Fini')
-
-def get_repetition_time(fmri):
-    """
-    :param fmri: path to fmri nifti.
-    :return: repetition time from pixdim4
-    """
-    cmd = 'fslval {task} pixdim4'.format(task=fmri)
-    popen = subprocess.Popen(cmd.split(), stdout=subprocess.PIPE)
-    stdout,stderr = popen.communicate()
-    repetition_time = float(stdout)
-    return repetition_time
-
-
-def mean_roi_signal(fmri, mask, output, fmri_res=2., roi_res=2.):
-    """
-    :param fmri: path to fmri nifti
-    :param mask: path to mask/roi nifti
-    :param output: output text file of time series of mean values within the
-    mask/roi
-    :return: None
-    """
-    cmd = 'fslmeants -i {fmri} -o {output} -m {mask}'
-    if fmri_res != roi_res:
-        resamplecmd = 'flirt -interp nearestneighbour -in {mask} -ref ' \
-                      '{fmri} -applyxfm -out {mask}'
-        resamplecmd = resamplecmd.format(fmri=fmri, output=output, mask=mask,
-                                         fmri_res=fmri_res)
-        subprocess.call(resamplecmd.split())
-    cmd = cmd.format(fmri=fmri, output=output, mask=mask)
-    subprocess.call(cmd.split())
-
-
-def make_masks(segmentation, wm_mask_out, vent_mask_out, **kwargs):
-    """
-    generates ventricular and white matter masks from a Desikan/FreeSurfer
-    segmentation file.  label constraints may be overridden.
-    :param segmentation: Desikan/FreeSurfer spec segmentation nifti file.
-    Does not need to be a cifti but must have labels according to FS lookup
-    table, including cortical parcellations.
-    :param wm_mask_out: binary white matter mask.
-    :param vent_mask_out: binary ventricular mask.
-    :param kwargs: dictionary of label value overrides.  You may override
-    default label number bounds for white matter and ventricle masks in the
-    segmentation file.
-    :return: None
-    """
-
-    wd = os.path.dirname(wm_mask_out)
-    # set parameter defaults
-    defaults = dict(wm_lt_R=2950, wm_ut_R=3050, wm_lt_L=3950, wm_ut_L=4050,
-                    vent_lt_R=43, vent_ut_R=43, vent_lt_L=4, vent_ut_L=4,
-                    roi_res=2)
-    # set temporary filenames
-    tempfiles = {
-        'wm_mask_L': os.path.join(wd, 'tmp_left_wm.nii.gz'),
-        'wm_mask_R': os.path.join(wd, 'tmp_right_wm.nii.gz'),
-        'vent_mask_L': os.path.join(wd, 'tmp_left_vent.nii.gz'),
-        'vent_mask_R': os.path.join(wd, 'tmp_right_vent.nii.gz'),
-        'wm_mask': os.path.join(wd, 'tmp_wm.nii.gz'),
-        'vent_mask': os.path.join(wd, 'tmp_vent.nii.gz')
-    }
-    # inputs and outputs
-    iofiles = {
-        'segmentation': segmentation,
-        'wm_mask_out': wm_mask_out,
-        'vent_mask_out': vent_mask_out
-    }
-    # command pipeline
-    cmdlist = [
-        'fslmaths {segmentation} -thr {wm_lt_R} -uthr {wm_ut_R} {wm_mask_R}',
-        'fslmaths {segmentation} -thr {wm_lt_L} -uthr {wm_ut_L} {wm_mask_L}',
-        'fslmaths {wm_mask_R} -add {wm_mask_L} -bin {wm_mask}',
-        'fslmaths {wm_mask} -kernel gauss {roi_res:g} -ero {wm_mask_out}',
-        'fslmaths {segmentation} -thr {vent_lt_R} -uthr {vent_ut_R} '
-        '{vent_mask_R}',
-        'fslmaths {segmentation} -thr {vent_lt_L} -uthr {vent_ut_L} '
-        '{vent_mask_L}',
-        'fslmaths {vent_mask_R} -add {vent_mask_L} -bin {vent_mask}',
-        'fslmaths {vent_mask} -kernel gauss {roi_res:g} -ero {vent_mask_out}'
-    ]
-
-    # get params
-    defaults.update(kwargs)
-    kwargs.update(defaults)
-    kwargs.update(iofiles)
-    kwargs.update(tempfiles)
-    # format and run commands
-    for cmdfmt in cmdlist:
-        cmd = cmdfmt.format(**kwargs)
-        subprocess.call(cmd.split())
-    # cleanup
-    for key in tempfiles.keys():
-        os.remove(tempfiles[key])
-
-
-def concatenate(concatlist, output_folder, legacy_tasknames):
-    version_name = '%s_v%s' % (__prog__, __version__)
-
-    for concat in concatlist:
-        for i,task in enumerate(concat):
-            if legacy_tasknames:
-                taskname = task[:-2]
-            else:
-            # this regex is more permissive than BIDS (which requires ses/task labels be alphanumeric)
-            # but is intended to be consistent with the task label extraction in helpers.py
-            # of the HCP-based DCAN pipelines
-                expr = re.compile(r'.*(ses-(?!None)[^_]+_).*')
-                session = expr.match(task)
-
-                expr = re.compile(r'.*(task-[^_]+).*')
-                tasklabel = expr.match(task)
-
-                if session:
-                    taskname = session.group(1) + tasklabel.group(1)
-                else:
-                    taskname = tasklabel.group(1)   
-
-            base_results_folder = os.path.join(output_folder, 'MNINonLinear',
-                                          'Results')
-            input_task_dtseries = os.path.join(base_results_folder, task,
-                                               version_name,
-                                               '%s_%s_Atlas.dtseries.nii' %
-                                               (task, version_name))
-            output_concat_dtseries = os.path.join(base_results_folder,
-                                                  '%s_%s_Atlas.dtseries.nii' %
-                                                  (taskname, version_name))
-            print("Concatenating %s to %s" % (task, output_concat_dtseries))
-            if i == 0:
-                if os.path.exists(output_concat_dtseries):
-                    os.remove(output_concat_dtseries)
-                shutil.copy(input_task_dtseries, output_concat_dtseries)
-            else:
-                cmd = ['%s/wb_command' % os.environ['CARET7DIR'],
-                       '-cifti-merge', output_concat_dtseries, '-cifti',
-                       output_concat_dtseries, '-cifti',
-                       input_task_dtseries]
-                subprocess.call(cmd)
-
-def parcellate(concatlist, output_folder, legacy_tasknames):
-    version_name = '%s_v%s' % (__prog__, __version__)
-
-    parcellation_folder = os.path.join(here, 'templates', 'parcellations')
-    parcellations = get_parcels(parcellation_folder)
-
-    for concat in concatlist:
-        if len(concat) > 0:
-            if legacy_tasknames:
-                taskname = concat[0][:-2]
-            else:
-            # this regex is more permissive than BIDS (which requires ses/task labels be alphanumeric)
-            # but is intended to be consistent with the task label extraction in helpers.py
-            # of the HCP-based DCAN pipelines
-                c = concat[0]
-                expr = re.compile(r'.*(ses-(?!None)[^_]+_).*')
-                session = expr.match(c)
-
-                expr = re.compile(r'.*(task-[^_]+).*')
-                tasklabel = expr.match(c)
-
-                if session:
-                    taskname = session.group(1) + tasklabel.group(1)
-                else:
-                    taskname = tasklabel.group(1)
-
-            base_results_folder = os.path.join(output_folder, 'MNINonLinear',
-                                               'Results')
-            output_concat_dtseries = os.path.join(base_results_folder,
-                                                  '%s_%s_Atlas.dtseries.nii' %
-                                                  (taskname, version_name))
-            # parcellation
-            for parcel_name, score in parcellations:
-                print("Parcellating with %s" % parcel_name)
-                output_subcorticals = os.path.join(
-                    base_results_folder,
-                    '%s_%s_%s_subcorticals.ptseries.nii' %
-                    (taskname, version_name, parcel_name)
-                )
-                output_parcellation = os.path.join(
-                    base_results_folder,
-                    '%s_%s_%s.ptseries.nii' %
-                    (taskname, version_name, parcel_name)
-                )
-                parcels = os.path.join(
-                    parcellation_folder, parcel_name, 'fsLR',
-                    '%s.32k_fs_LR.dlabel.nii' % parcel_name
-                )
-                subcorticals = os.path.join(
-                    parcellation_folder, parcel_name, 'fsLR',
-                    '%s.subcortical.32k_fs_LR.dlabel.nii' % parcel_name
-                )
-                # score of 1 is cortical, 2 is subcortical, and 3 is both
-                if score in (1, 3):
-                    cmd = ['%s/wb_command' % os.environ['CARET7DIR'],
-                           '-cifti-parcellate', '-legacy-mode', output_concat_dtseries,
-                           parcels, 'COLUMN', output_parcellation]
-                    print(cmd)
-                    subprocess.call(cmd)
-                if score in (2, 3):
-                    cmd = ['%s/wb_command' % os.environ['CARET7DIR'],
-                            '-cifti-parcellate', '-legacy-mode', output_concat_dtseries,
-                            subcorticals, 'COLUMN', output_subcorticals]
-                    print(cmd)
-                    subprocess.call(cmd)
-
-
-def get_parcels(parcellation_folder, space='fsLR'):
-    """
-    gets the valid labels out of the parcellation folder.
-    :param parcellation_folder: base directory for parcellations
-    :param space: name of the space for the parcellations
-    :return: list of 2-tuples, first element is the name of the label, the
-    second element is a score:
-    1: only a cortical dlabel exists.
-    2: only a subcortical dlabel exists.
-    3: both cortical and subcortical dlabel files exist.
-    """
-    walker = list(os.walk(parcellation_folder))
-    # find all folders which contain a space subdirectory
-    candidates = [x for x in walker if space == os.path.basename(x[0])]
-    # check that the proper dlabel files can be found.
-    parcel_names = []
-    for x in candidates:
-        print(x)
-        label_name = os.path.basename(os.path.dirname(x[0]))
-        score = ( ('%s.32k_fs_LR.dlabel.nii' % label_name) in x[2] ) + \
-            2 * ('%s.subcortical.32k_fs_LR.dlabel.nii' % label_name in x[2])
-        print(score)
-        if score:
-            parcel_names.append((label_name, score))
-        else:
-            print('%s is a bad label file directory' % label_name)
-    print(parcel_names)
-    return parcel_names
-
-
-def float_or_None(x):
-    if x.lower() == 'none':
-        return None
+    # Concatenate regressors
+    if GSR:
+        R = np.concatenate(
+            (Glob, dGlob, FR), axis = 1
+        ) # with GSR # N.B. this uses 30 parameter, for 36 parameter it would also involve the square of Glob and dGlob
     else:
-        return float(x)
+        R = FR
 
+    # Part III: Regression and bandpass filter to give cleaned BOLD data
+    # Demean and detrend regressors
+    R = R - np.mean(R[keepframe, :], axis=0)
+    R = detrend_manual(R, keepframe)
+    data_dd = fdata - np.mean(fdata[keepframe, :], axis=0)
+    data_dd = detrend_manual(data_dd, keepframe)
+
+    if not skip_save_figures:
+        # grayplots
+        crange = [-200, 200] # using +/-2% as Jonathan Power's papers, but DCAN used +/-6%
+        plt.figure(figsize=(8,4))
+        im = plt.imshow(data_dd.transpose(), aspect='auto', cmap='gray')
+        plt.colorbar(location='right')
+        im.set_clim(crange)
+        plt.plot(np.where(keepframe==0)[0], np.repeat(0, sum(keepframe==0)), 'r|')
+        plt.yticks([])
+        plt.xlabel('TR (in seconds)')
+        plt.savefig(
+            os.path.join(output_path, 'grayplots_all.png'),
+            format='png',
+            dpi=300
+        )
+        plt.close()
+
+        plt.figure(figsize=(8,4))
+        X = data_dd.copy()
+        X[np.where(keepframe==1)[0]] = np.NaN
+        im = plt.imshow(X.transpose(), aspect='auto', cmap='gray')
+        plt.colorbar(location='right')
+        im.set_clim(crange)
+        plt.yticks([])
+        plt.xlabel('TR (in seconds)')
+        plt.savefig(
+            os.path.join(output_path, 'grayplots_removed.png'),
+            format='png',
+            dpi=300
+        )
+        plt.close()
+
+        plt.figure(figsize=(8,4))
+        X = data_dd.copy()
+        X[np.where(keepframe==0)[0]] = np.NaN
+        im = plt.imshow(X.transpose(), aspect='auto', cmap='gray')
+        plt.colorbar(location='right')
+        im.set_clim(crange)
+        plt.yticks([])
+        plt.xlabel('TR (in seconds)')
+        plt.savefig(
+            os.path.join(output_path, 'grayplots_retained.png'),
+            format='png',
+            dpi=300
+        )
+        plt.close()
+
+    # Nuisance regression (line 121 in dcan_signal_processing.m)
+    b, _, _, _ = np.linalg.lstsq(R[keepframe, :], data_dd[keepframe, :], rcond=None)
+    data_postreg = data_dd - R @ b
+    DVAR_post_reg = calculate_dvars_from_cifti(data_postreg)
+
+    # Linear interpolation before bandpass (line 144 in dcan_signal_processing.m)
+    x = np.where(keepframe)[0]
+    x_removed = np.where(keepframe == 0)[0]
+    data_interpolated = data_postreg.copy()
+    
+    x_outsidebound = (x_removed < x[0]) | (x_removed > x[-1])
+    y_removed = np.apply_along_axis(
+        lambda col: np.interp(x_removed, x, col[keepframe]), axis=0, arr=data_postreg
+    )
+    # Replace extrapolated points with mean of retained (6 params)
+    y_mean = np.mean(data_postreg[keepframe, :], axis=0)
+    y_removed[x_outsidebound, :] = y_mean
+
+    
+    data_interpolated[keepframe==0, :] = y_removed
+
+    # Bandpass filter with manual zero padding
+    fs = 1 / TR  # Sampling frequency
+    fNy = fs / 2  # Nyquist frequency
+    b_filt, a_filt = scipy.signal.butter(
+        bandpass_filter_order / 2,
+        np.array([lowpass_cutoff, highpass_cutoff]) / fNy,
+        "bandpass",
+    )
+
+    # Zero-pad the data for filtering by concatenating rows of zeros on either side of the data
+    padding = np.zeros_like(
+        data_interpolated
+    )  # Create a padding array of the same shape as Rr_int
+    pad_amt = padding.shape[0]  # Number of rows to pad
+
+    # Concatenate padding rows on top and bottom of Rr_int
+    temp = np.vstack((padding, data_interpolated, padding))
+
+    # Apply the filtfilt function (zero-phase filtering)
+    data_filtered = scipy.signal.filtfilt(
+        b_filt, a_filt, temp, axis=0, padtype=None
+    )  
+    
+    # Apply filtering along the rows (axis=0)
+    data_filtered = data_filtered[pad_amt:-pad_amt]
+    DVAR_post_filter = calculate_dvars_from_cifti(data_filtered)
+
+    if not skip_save_figures:
+        plt.figure(figsize=(8, 4))
+        plt.plot(DVAR_pre_reg, linewidth=1, label="DVARS pre regression", color="b")
+        plt.plot(DVAR_post_reg, linewidth=1, label="DVARS post regression", color="r")
+        plt.plot(DVAR_post_filter, linewidth=1, label="DVARS post filtered", color="g")
+        plt.xlabel("TR")
+        plt.legend()
+        plt.savefig(
+            os.path.join(output_path, "DVARS_trace.png"), format="png", dpi=300
+        )
+        plt.close()
+
+    if GSR:
+        logging.info("Saving cleaned data (w/GSR)")
+    else:
+        logging.info("Saving cleaned data (wo/GSR)")
+
+    # Save filtered data
+    ax1 = image.header.get_axis(0)
+    ax2 = image.header.get_axis(1)
+    header = (ax1, ax2)
+    output_image = nib.cifti2.cifti2.Cifti2Image(np.single(data_filtered), header)
+    output_image.to_filename(
+        os.path.join(
+            output_path,
+            input_json["FNL_preproc_CIFTI_basename"] + ".dtseries.nii",
+        )
+    )
+    return
+    
+# All dependency functions
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='confound removal for BOLD fMRI data')
+    parser.add_argument(
+        'input_path',
+        help='Path to input data, i.e. data preprocessed and mapped to standard space',
+        type=str
+    )
+    parser.add_argument(
+        'subject_id',
+        type=str,
+        help="The subject number without 'sub-'"
+    )
+    parser.add_argument(
+        'task_id',
+        type=str,
+        help="The folder name for the scan without 'task-', i.e. 'rest01' for 'task-rest01'"
+    )
+    parser.add_argument(
+        'output_path',
+        help='Path to store results',
+        type=str
+    )
+    parser.add_argument(
+        '--session_id',
+        type=int,
+        help="Session id for the subject without 'ses-' (defaults to 0)",
+        required=False,
+        default=0
+    )
+    parser.add_argument(
+        '--settings_file',
+        type=str,
+        help='path to json file for settings (defaults to DCANBOLDProcessing location assuming that pipeline was run)',
+        required=False
+    ),
+    parser.add_argument(
+        '--skip_save_figures',
+        help='Skip saving output figures',
+        action='store_true',
+        required=False
+    )
+    parser.add_argument(
+        '--GSR',
+        help='Include Global Signal Regression (CSF, WM, GM, and derivatives)',
+        action='store_true',
+        required=False
+    ),
+    parser.add_argument(
+        '--FD_type',
+        type=int,
+        help='L1 [1] (default) or L2 [2]',
+        default=1
+    )
+    parser.add_argument(
+        '--brain_radius',
+        type=int,
+        default=50,
+        help='estimage of brain radius in mm. Used for FD and movement regressors (default: 50)'
+    )
+    parser.add_argument(
+        '--bandpass_filter_order',
+        type=int,
+        default=2,
+        help='Order for the bandpass filter used for respiration filter (default: 2)',
+    )
+    parser.add_argument(
+        '--highpass_cutoff',
+        type=float,
+        default=0.08,
+        help='Highpass filter cutoff frequence in Hertz (default: 0.08)'
+    )
+    parser.add_argument(
+        '--lowpass_cutoff',
+        type=float,
+        default=0.009,
+        help='Lowpass filter cutoff frequence in Hertz (default: 0.009)'
+    )
+    parser.add_argument(
+        '--skip_seconds',
+        type=int,
+        default=5,
+        help='Seconds to skip at beginning (default: 5)'
+    )
+    parser.add_argument(
+        '--fd_threshold',
+        type=float,
+        default=0.3,
+        help='Framewise displacement threshold (default: 0.3)'
+    )
+    return parser.parse_args()
+
+def calculate_dvars_from_cifti(data):
+    """
+    This function calculates DVARS (Derivative of Variance) based on grayordinates (WM and non-brain excluded).
+
+    Parameters:
+    data (ndarray): 2D numpy array with shape (tr, g), where g represents the number of grayordinates and tr is the number of time points.
+
+    Returns:
+    dvars (float): The calculated DVARS value.
+    """
+    # Check size and transpose if needed
+    num_timepoints, num_grayordinates = data.shape
+    if num_grayordinates < num_timepoints:
+        data = data.T
+        print("data transposed due to timepoints > grayordinates, double check input")
+
+    # Calculate differences across timepoints
+    data_diff = np.diff(data, axis=0)
+
+    # Calculate DVARS as the root mean square of the differences
+    dvars = np.hstack((np.nan, np.sqrt(np.mean(data_diff**2, axis=1))))
+
+    return dvars
+
+def make_friston_regressors(R, hd_mm):
+    """
+    This function takes a matrix `MR` of 6 degrees of freedom (DOF) movement correction
+    parameters and calculates the corresponding 24 Friston regressors.
+
+    Parameters:
+    -----------
+    MR : numpy array of shape (r, c)
+        A matrix where r is the number of time points and c are the 6 DOF movement regressors.
+        If the number of columns is more than 6, only the first 6 columns are considered.
+
+    hd_mm : float, optional
+        The head radius in mm. Default is 50 mm.
+
+    Returns:
+    --------
+    FR : numpy array of shape (r, 24)
+        A matrix containing 24 Friston regressors.
+    """
+    MR = R[:, :6]
+    MR[:, 3:] = MR[:, 3:] * np.pi * hd_mm / 180
+    # Calculate the first part of the Friston regressors (MR and MR^2)
+    FR = np.hstack([MR, MR**2])
+
+    # Create a dummy array for the temporal derivatives (lagged version of FR)
+    dummy = np.zeros_like(FR)
+    dummy[1:, :] = FR[:-1, :]  # shift FR by one time step
+    dummy[0, :] = 0  # set the first row to 0
+
+    # Concatenate the original FR and the lagged version
+    FR = np.hstack([FR, dummy])
+    return FR
+
+def calc_FD(R, FD_type=1):
+    '''
+    This function calculates framewise displacement (Power et al. 2012 Neuroimage)
+    The columns 3-6 (angular displacement) is assumed to be already converted to mm before passed in this function
+    '''
+
+    dR = np.diff(R, axis=0)  # First-order derivative
+    ddR = np.diff(dR, axis=0)  # Second-order derivative
+    if FD_type == 1:
+        # L1-norm - sum of absolute values of first-order derivatives
+        FD = np.sum(np.absolute(dR), axis=1)
+        meanFD = np.mean(FD)
+        FD = np.hstack(
+            (
+                np.zeros(
+                    1,
+                ),
+                FD,
+            )
+        )  # Pad zeros to make it the same length as the original data
+    elif FD_type == 2:
+        # L2-norm - sum of absolute values of second-order derivatives
+        FD = np.sum(np.absolute(ddR), axis=1)
+        meanFD = np.mean(FD)
+        FD = np.hstack(
+            (
+                np.zeros(
+                    2,
+                ),
+                FD,
+            )
+        )  # Pad zeros to make it the same length as the original data
+    return FD, meanFD
+
+def detrend_manual(data, keepframe):
+    '''
+    Remove linear trends
+    '''
+    detrended_data = data.copy()
+    time_points = np.where(keepframe)[0]
+    time_points_all = np.array(range(keepframe.shape[0]))
+
+    # Create the design matrix for linear regression (constant + linear term)
+    X = np.vstack(
+        [time_points, np.ones(len(time_points))]
+    ).T  # Shape (len(keepframe), 2)
+    Xall = np.vstack([time_points_all, np.ones(len(time_points_all))]).T
+
+    # Perform the linear regression for all columns at once using least squares
+    # Y is the data[keepframe, :] with shape (len(keepframe), n)
+    Y = data[keepframe, :]
+
+    # Compute the least squares solution to find the slope and intercept for each column
+    beta, _, _, _ = np.linalg.lstsq(X, Y, rcond=None)  # beta shape is (2, n)
+
+    # Calculate the trend for each column using the coefficients
+    trend = Xall @ beta  # Shape (len(keepframe), n)
+
+    # Subtract the trend from the data at the all indices
+    detrended_data -= trend
+
+    return detrended_data
 
 if __name__ == '__main__':
-    _cli()
+    main(*parse_arguments())
