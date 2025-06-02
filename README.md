@@ -4,6 +4,8 @@
 
 2025.06.02 - Jim made some updates about loading the files. Also it seems the DCAN lab had some updates since Dec 2024 to incorporate no GSR but their no GSR means no average grayordinate signal in the regressor, but we did not have grayordinates, white matter and CSF signal in the regressor. Maybe fix the naming at some point to avoid confusion and provide different options? Also Donna/me had some scripts to create the white matter signal and CSF signal from the volume (NIFTI) data if they do not exist in the original folder, consider adding those in at some point.
 
+(Below is the original README from the DCAN lab)
+
 \*\*
 This is a repository for the dcan labs bold signal processing. It is 
 forked from FNL\_preproc and is meant to take its place.
