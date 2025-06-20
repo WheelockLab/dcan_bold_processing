@@ -520,4 +520,4 @@ def detrend_manual(data, keepframe):
     return detrended_data
 
 if __name__ == '__main__':
-    main(*parse_arguments())
+    main(**vars(parse_arguments()))
